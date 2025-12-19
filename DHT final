@@ -1,0 +1,207 @@
+#include <WiFiS3.h>
+#include <WiFiUdp.h>
+#include <SimpleDHT.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+/* ================= WiFi 설정 ================= */
+char ssid[] = "G140_IoT_2.4G";
+char password[] = "smart02_140@";
+
+/* ================= 핀 설정 ================= */
+const int FAN_PIN  = 7;
+const int PUMP_PIN = 5;
+const int LED_PIN  = 6;
+const int DHT_PIN  = 2;
+
+/* 릴레이 논리 */
+#define RELAY_ON  LOW
+#define RELAY_OFF HIGH
+
+/* ================= 객체 ================= */
+SimpleDHT11 dht11(DHT_PIN);
+LiquidCrystal_I2C lcd(0x3F, 16, 2);
+
+/* ================= NTP (UNO R4 안정 방식) ================= */
+WiFiUDP udp;
+const char* ntpServer = "pool.ntp.org";
+const int NTP_PACKET_SIZE = 48;
+byte ntpBuffer[NTP_PACKET_SIZE];
+
+/* ================= 시간 기준 ================= */
+int baseHour = 0, baseMinute = 0, baseSecond = 0;
+unsigned long baseMillis = 0;
+
+/* ================= 센서 ================= */
+int temperature = -1;
+unsigned long lastSensorRead = 0;
+unsigned long lastLCDUpdate  = 0;
+
+/* ================= 펌프 ================= */
+unsigned long pumpStartTime = 0;
+bool pumpRunning = false;
+int lastMinute = -1;
+
+/* ================= NTP 패킷 전송 ================= */
+void sendNTPpacket() {
+  memset(ntpBuffer, 0, NTP_PACKET_SIZE);
+  ntpBuffer[0] = 0b11100011;
+  ntpBuffer[1] = 0;
+  ntpBuffer[2] = 6;
+  ntpBuffer[3] = 0xEC;
+
+  udp.beginPacket(ntpServer, 123);
+  udp.write(ntpBuffer, NTP_PACKET_SIZE);
+  udp.endPacket();
+}
+
+/* ================= NTP 시간 수신 ================= */
+bool syncTimeFromNTP() {
+  udp.begin(2390);
+  sendNTPpacket();
+
+  unsigned long start = millis();
+  while (millis() - start < 3000) {
+    int size = udp.parsePacket();
+    if (size >= NTP_PACKET_SIZE) {
+      udp.read(ntpBuffer, NTP_PACKET_SIZE);
+
+      unsigned long highWord = word(ntpBuffer[40], ntpBuffer[41]);
+      unsigned long lowWord  = word(ntpBuffer[42], ntpBuffer[43]);
+      unsigned long secs1900 = (highWord << 16) | lowWord;
+
+      unsigned long epoch = secs1900 - 2208988800UL;
+      epoch += 9 * 3600UL; // 한국시간
+
+      baseHour   = (epoch % 86400UL) / 3600;
+      baseMinute = (epoch % 3600UL) / 60;
+      baseSecond = epoch % 60;
+      baseMillis = millis();
+
+      return true;
+    }
+  }
+  return false;
+}
+
+/* ================= WiFi + 시간 ================= */
+void setupWiFiAndTime() {
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) delay(500);
+  delay(2000);
+  syncTimeFromNTP();
+}
+
+/* ================= 시간 계산 ================= */
+void getTime(int &h, int &m, int &s) {
+  unsigned long total =
+    baseHour * 3600UL +
+    baseMinute * 60UL +
+    baseSecond +
+    (millis() - baseMillis) / 1000UL;
+
+  total %= 86400UL;
+  h = total / 3600;
+  m = (total % 3600) / 60;
+  s = total % 60;
+}
+
+/* ================= DHT11 ================= */
+void readDHT() {
+  if (millis() - lastSensorRead >= 2000) {
+    byte t = 0, h = 0;
+    if (dht11.read(&t, &h, NULL) == SimpleDHTErrSuccess) {
+      temperature = t;
+    } else {
+      temperature = -1;
+    }
+    lastSensorRead = millis();
+  }
+}
+
+/* ================= LCD (깜빡임 없음) ================= */
+void updateLCD(int h, int m, int s) {
+  if (millis() - lastLCDUpdate >= 1000) {
+    lcd.setCursor(0, 0);
+    lcd.print("Time ");
+    if (h < 10) lcd.print("0");
+    lcd.print(h); lcd.print(":");
+    if (m < 10) lcd.print("0");
+    lcd.print(m); lcd.print(":");
+    if (s < 10) lcd.print("0");
+    lcd.print(s);
+
+    lcd.setCursor(0, 1);
+    lcd.print("Temp ");
+    if (temperature >= 0) {
+      lcd.print(temperature);
+      lcd.print("C   ");
+    } else {
+      lcd.print("--C  ");
+    }
+
+    lastLCDUpdate = millis();
+  }
+}
+
+/* ================= LED ================= */
+void controlLED(int hour) {
+  digitalWrite(LED_PIN,
+    (hour >= 5 && hour < 21) ? RELAY_ON : RELAY_OFF);
+}
+
+/* ================= 펌프 + 팬 ================= */
+void controlPump(int minute, int hour) {
+  if (hour >= 21 || hour < 5) {
+    digitalWrite(FAN_PIN, RELAY_OFF);
+    digitalWrite(PUMP_PIN, RELAY_OFF);
+    pumpRunning = false;
+    return;
+  }
+
+  if (minute == 0 && lastMinute != 0 && !pumpRunning) {
+    digitalWrite(FAN_PIN, RELAY_ON);
+    digitalWrite(PUMP_PIN, RELAY_ON);
+    pumpStartTime = millis();
+    pumpRunning = true;
+  }
+
+  if (pumpRunning) {
+    unsigned long elapsed = millis() - pumpStartTime;
+    if (elapsed >= 60000UL)  digitalWrite(PUMP_PIN, RELAY_OFF);
+    if (elapsed >= 180000UL) {
+      digitalWrite(FAN_PIN, RELAY_OFF);
+      pumpRunning = false;
+    }
+  }
+  lastMinute = minute;
+}
+
+/* ================= SETUP ================= */
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(FAN_PIN, OUTPUT);
+  pinMode(PUMP_PIN, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
+
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.print("Plant Monitor");
+
+  setupWiFiAndTime();
+}
+
+/* ================= LOOP ================= */
+void loop() {
+  int h, m, s;
+
+  getTime(h, m, s);
+  readDHT();
+  updateLCD(h, m, s);
+  controlLED(h);
+  controlPump(m, h);
+
+  delay(200);
+}
